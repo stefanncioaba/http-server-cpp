@@ -3,6 +3,7 @@
 #include <netinet/in.h> 
 #include <unistd.h>
 #include "http_request.h"
+#include "http_response.h"
 
 #define PORT 8080 // the port users will be connecting to
 #define BACKLOG 10 // how many pending connections queue holds
@@ -58,6 +59,7 @@ int main() {
             msg.append(buffer, recv_bytes);
         }
         
+        // Parse the HTTP request from the received message
         HttpRequest request = parse_request(msg);
 
         if(request.method.empty()) {
@@ -66,8 +68,21 @@ int main() {
             continue;
         }
 
-        std::string response = request.version + " 200 OK\r\n\r\n";
-        int send_bytes = send(new_fd, response.c_str(), response.size(), 0);
+        // Create an HTTP response based on the request
+        HttpResponse response = create_response(request);
+        std::string response_string;
+        response_string += response.version + " " + std::to_string(response.status_code) + " " + response.reason_phrase + "\r\n";
+        for (const auto& header : response.headers) {
+            response_string += header.first + ": " + header.second + "\r\n";
+        }
+        response_string += "\r\n"; // End of headers
+        response_string += response.body; // Append the body
+        
+        // Send the response back to the client
+        ssize_t sent_bytes = send(new_fd, response_string.c_str(), response_string.size(), 0);
+        if (sent_bytes < 0) {
+            std::cerr << "Send failed" << std::endl;
+        }
 
         close(new_fd); // Close the connection after sending the message
     }

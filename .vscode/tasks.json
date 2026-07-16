@@ -9,6 +9,7 @@
                 "-g",
                 "main.cpp",
                 "http_request.cpp",
+                "http_response.cpp",
                 "-o",
                 "${fileDirname}/${fileBasenameNoExtension}"
             ],

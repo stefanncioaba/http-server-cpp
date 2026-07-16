@@ -1,6 +1,9 @@
 # Compiled binaries
 main
+http_request
+http_response
 *.o
 *.out
 *.exe
 
+public
