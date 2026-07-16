@@ -81,26 +81,6 @@ HttpRequest parse_request(const std::string &raw) {
         }
     }
 
-    // If the method is POST or PUT, read the body based on Content-Length header
-    if(method == "POST" || method == "PUT") {
-        // Points to where content-length header is found in the headers map
-        auto find_content_length = request.headers.find("content-length");
-        // If the content-length header is found, process the body
-        if(find_content_length != request.headers.end()) {
-            // Process the content length
-            try {
-                size_t content_length = std::stoul(find_content_length->second);
-                std::string body;
-                body.resize(content_length);
-                // Read the body and write it to the body string
-                request_stream.read(&body[0], content_length);
-                request.body = body;
-            } catch (const std::exception& e) { // Catch any exception thrown by std::stoul
-                std::cerr << "Error parsing Content-Length: " << e.what() << std::endl;
-            }
-        }
-    }
-
-    return request; // Return an HttpRequest object with parsed values
+    return request; // Return an HttpRequest object with parsed values WITHOUT BODY
 }
 

@@ -54,12 +54,11 @@ int main() {
         
         // Keep receiving data until we find the end of the HTTP headers (indicated by \r\n\r\n)
         while (msg.find("\r\n\r\n") == std::string::npos) {
-            ssize_t recv_bytes = recv(new_fd, buffer, BUFFER_SIZE, 0);
+            recv_bytes = recv(new_fd, buffer, BUFFER_SIZE, 0);
             if (recv_bytes <= 0) break;  // connection closed or error
             msg.append(buffer, recv_bytes);
         }
         
-        // Parse the HTTP request from the received message
         HttpRequest request = parse_request(msg);
 
         if(request.method.empty()) {
@@ -68,16 +67,36 @@ int main() {
             continue;
         }
 
+        // Get content length from headers if present and read the body accordingly
+        if(request.method == "POST") {
+            auto it = request.headers.find("content-length");
+            if (it != request.headers.end()) {
+                size_t content_length = std::stoul(it->second);
+                // If the body is not fully received, keep receiving until we have the full body
+                size_t header_end = msg.find("\r\n\r\n");
+                size_t body_start = header_end + 4;
+
+                request.body = msg.substr(body_start);
+                
+                while (request.body.size() < content_length) {
+                    recv_bytes = recv(new_fd, buffer, BUFFER_SIZE, 0);
+                    if (recv_bytes <= 0) break;  // connection closed or error
+                    request.body.append(buffer, recv_bytes);
+                }
+            }
+        }
+
         // Create an HTTP response based on the request
         HttpResponse response = create_response(request);
         std::string response_string;
+
         response_string += response.version + " " + std::to_string(response.status_code) + " " + response.reason_phrase + "\r\n";
         for (const auto& header : response.headers) {
             response_string += header.first + ": " + header.second + "\r\n";
         }
         response_string += "\r\n"; // End of headers
         response_string += response.body; // Append the body
-        
+
         // Send the response back to the client
         ssize_t sent_bytes = send(new_fd, response_string.c_str(), response_string.size(), 0);
         if (sent_bytes < 0) {

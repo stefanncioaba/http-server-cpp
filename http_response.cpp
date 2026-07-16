@@ -31,10 +31,16 @@ HttpResponse create_response(const HttpRequest& request) {
     HttpResponse response;
     response.version = request.version;
     if(request.method == "GET") {
+        
+        std::string req_path = request.path;
+        if (req_path.back() == '/') {
+            req_path += "index.html";
+        }
+
         // Use canonical to resolve the absolute path (ex: /home/user/project/public/index.html)
         fs::path base = fs::canonical("./public");
         // Use weakly_canonical to resolve the requested path relative to the base directory 
-        fs::path file_path = fs::weakly_canonical(base / request.path.substr(1));
+        fs::path file_path = fs::weakly_canonical(base / req_path.substr(1));
         // Check if the requested path is within the base directory
         fs::path relative_path = file_path.lexically_relative(base);
 
@@ -71,16 +77,14 @@ HttpResponse create_response(const HttpRequest& request) {
             response.status_code = 403;
             response.reason_phrase = "Forbidden";
         } else {
-            // Create the parent directories if they don't exist
-            fs::path parent_dir = file_path.parent_path();
-            fs::create_directories(parent_dir);
-            // Open the file in binary mode and write the request body to it
             if (fs::exists(file_path)) {
                 response.status_code = 409;
                 response.reason_phrase = "Conflict error";
             } else {
+                // Create the parent directories if they don't exist
                 fs::path parent_dir = file_path.parent_path();
                 fs::create_directories(parent_dir);
+                // Open the file in binary mode and write the request body to it
                 std::ofstream file(file_path, std::ios::binary);
                 if (!file) {
                     response.status_code = 500;
