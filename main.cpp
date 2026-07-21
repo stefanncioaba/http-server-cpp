@@ -6,88 +6,193 @@
 #include <vector>
 #include "http_request.h"
 #include "http_response.h"
-
-#include <atomic>
+#include "connection.h"
+#include <unordered_map>
+#include <memory>
+#include <fcntl.h>
+#include <sys/epoll.h>
+#include <unordered_map>
+#include <cerrno>
 
 #define PORT 8080 // the port users will be connecting to
 #define BACKLOG 4096 // how many pending connections queue holds
 #define BUFFER_SIZE 1024 // size of the buffer for receiving data
 
-std::atomic<int> thread_count{0}; // NEW: tracks successful thread creations
 
-void handle_client(int new_fd) {
-    std::string connection = "keep-alive"; // Default connection type
-    while(connection == "keep-alive") {
-        // Buffer to store the received message
-        char buffer[BUFFER_SIZE];
-        // Whole message received from the client
-        ssize_t recv_bytes;
-        std::string msg;
-        
-        // Keep receiving data until we find the end of the HTTP headers (indicated by \r\n\r\n)
-        while (msg.find("\r\n\r\n") == std::string::npos) {
-            recv_bytes = recv(new_fd, buffer, BUFFER_SIZE, 0);
-            if (recv_bytes <= 0) {
-                close(new_fd); // Close the connection if there's an error or the client closed the connection
-                return;
-            } // connection closed or error
-            msg.append(buffer, recv_bytes);
-        }
-        
-        HttpRequest request = parse_request(msg);
 
-        if(request.method.empty()) {
-            std::cerr << "Failed to parse HTTP request" << std::endl;
-            close(new_fd); // Close the connection if parsing fails
-            return;
-        }
+int set_nonblocking(int fd) {
+    // Get the current flags of the file descriptor
+    int flags = fcntl(fd, F_GETFL, 0);
+    // Check if fcntl failed
+    if (flags == -1) {
+        std::cerr << "fcntl F_GETFL failed" << std::endl;
+        return -1;
+    }
+    // Set the file descriptor to non-blocking mode by using bitwise OR to add the O_NONBLOCK flag
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        std::cerr << "fcntl F_SETFL failed" << std::endl;
+        return -1;
+    }
+    return 0;
+}
 
-        // Get content length from headers if present and read the body accordingly
-        if(request.method == "POST") {
-            auto it = request.headers.find("content-length");
-            if (it != request.headers.end()) {
-                size_t content_length = std::stoul(it->second);
-                // If the body is not fully received, keep receiving until we have the full body
-                size_t header_end = msg.find("\r\n\r\n");
-                size_t body_start = header_end + 4;
+// Function to close a connection and clean up resources
+void close_connection(int fd, std::unordered_map<int, Connection>& connections, int epoll_fd) {
+    // Remove the file descriptor from the epoll instance and erase it from the connections map
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    connections.erase(fd);
+    close(fd);
+}
 
-                request.body = msg.substr(body_start);
+// Helper for preparing the response 
+void prepare_response(Connection& conn) {
+    HttpResponse response = create_response(conn.request);
+
+    // Build the response string from the HttpResponse object
+    std::string response_string;
+    response_string += response.version + " " + std::to_string(response.status_code) + " " + response.reason_phrase + "\r\n";
+    for (const auto& header : response.headers) {
+        response_string += header.first + ": " + header.second + "\r\n";
+    }
+    response_string += "\r\n";
+    response_string += response.body;
+
+    conn.write_buf = response_string;
+    conn.write_offset = 0;
+
+    // Check if the response has a "Connection" header to determine if we should keep the connection alive
+    if (response.headers.find("connection") != response.headers.end()) {
+        conn.keep_alive = (response.headers["connection"] == "keep-alive");
+    } 
+}
+
+// Function to handle a client connection that is ready for reading or writing
+void handle_client_ready(int fd, std::unordered_map<int, Connection>& connections, int epoll_fd) {
+    Connection& conn = connections[fd];
+    
+    // If the connection is in the READING_HEADERS state, we read data from the socket and accumulate it in the buffer. 
+    // We check for the end of the headers (indicated by \r\n\r\n) and update the connection state accordingly. 
+    // If the connection is closed or an error occurs, we close the connection and clean up resources.
+    if (conn.state == ConnectionState::READING_HEADERS) {
+        // Buffer to store the received data
+        char buf[BUFFER_SIZE];
+        ssize_t n = recv(fd, buf, BUFFER_SIZE, 0);
+        // If we received data, we append it to the connection's buffer and check for the end of the headers.
+        if (n > 0) {
+            conn.buffer.append(buf, n);
+
+            size_t pos = conn.buffer.find("\r\n\r\n");
+            // If we found the end of the headers ...
+            if (pos != std::string::npos) {
+                conn.header_end = pos + 4;
                 
-                while (request.body.size() < content_length) {
-                    recv_bytes = recv(new_fd, buffer, BUFFER_SIZE, 0);
-                    if (recv_bytes <= 0) break;  // connection closed or error
-                    request.body.append(buffer, recv_bytes);
+                conn.request = parse_request(conn.buffer);
+
+                // If the request method is empty, it indicates a parsing failure, and we close the connection.
+                if (conn.request.method.empty()) {
+                    std::cerr << "Failed to parse HTTP request" << std::endl;
+                    close_connection(fd, connections, epoll_fd);
+                    return;
+                }
+
+                if (conn.request.method == "POST") {
+                    auto it = conn.request.headers.find("content-length");
+                    if (it != conn.request.headers.end()) {
+                        // Read the content length from the headers and store it in the connection object
+                        conn.content_length = std::stoul(it->second);
+                    }
+
+                    // Body bytes that already arrived alongside the headers, in the same buffer
+                    conn.request.body = conn.buffer.substr(conn.header_end);
+
+                    // If the body is fully received, we transition to the WRITING state; otherwise, we transition to READING_BODY.
+                    if (conn.request.body.size() >= conn.content_length) {
+                        conn.state = ConnectionState::WRITING;
+                        prepare_response(conn);
+                        struct epoll_event mod_ev;
+                        mod_ev.events = EPOLLOUT;
+                        mod_ev.data.fd = fd;
+                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &mod_ev);
+                    } else {
+                        conn.state = ConnectionState::READING_BODY;
+                    }
+                } else { // For GET and other methods, we transition directly to the WRITING state and prepare the response.
+                    conn.state = ConnectionState::WRITING;
+                    prepare_response(conn);
+                    struct epoll_event mod_ev;
+                    mod_ev.events = EPOLLOUT;
+                    mod_ev.data.fd = fd;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &mod_ev);
                 }
             }
+        } else if (n == 0) { // Connection closed by the client
+            close_connection(fd, connections, epoll_fd);
+        } else { // Error occurred while reading
+            if (errno != EAGAIN && errno != EWOULDBLOCK) { // If the error is not EAGAIN or EWOULDBLOCK, we close the connection
+                close_connection(fd, connections, epoll_fd);
+            }
+        }   
+      
+    } else if (conn.state == ConnectionState::READING_BODY) {
+        char buf[BUFFER_SIZE];
+        ssize_t n = recv(fd, buf, BUFFER_SIZE, 0);
+
+        if (n > 0) {
+            conn.request.body.append(buf, n);
+            // If the body is fully received, we transition to the WRITING state and prepare the response.
+            if (conn.request.body.size() >= conn.content_length) {
+                conn.state = ConnectionState::WRITING;
+                prepare_response(conn);
+                struct epoll_event mod_ev;
+                mod_ev.events = EPOLLOUT;
+                mod_ev.data.fd = fd;
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &mod_ev);
+            }
+        } else if (n == 0) {
+            close_connection(fd, connections, epoll_fd);
+        } else {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                close_connection(fd, connections, epoll_fd);
+            }
         }
+    } else if (conn.state == ConnectionState::WRITING) {
+        // Send starting from the current write_offset in the write_buf and only send the remaining bytes
+        ssize_t n = send(fd, conn.write_buf.c_str() + conn.write_offset,
+                      conn.write_buf.size() - conn.write_offset, 0);
 
-        // Create an HTTP response based on the request
-        HttpResponse response = create_response(request);
-        std::string response_string;
+        if (n > 0) {
+            // Update the write_offset to reflect how many bytes have been sent so far
+            conn.write_offset += n;
+            
+            if (conn.write_offset >= conn.write_buf.size()) {
+                // Full response sent
+                if (conn.keep_alive) {
+                    conn.state = ConnectionState::READING_HEADERS;
+                    conn.buffer.clear();
+                    conn.header_end = 0;
+                    conn.content_length = 0;
+                    conn.write_buf.clear();
+                    conn.write_offset = 0;
+                    conn.request = HttpRequest{};
 
-        response_string += response.version + " " + std::to_string(response.status_code) + " " + response.reason_phrase + "\r\n";
-        for (const auto& header : response.headers) {
-            response_string += header.first + ": " + header.second + "\r\n";
+                    struct epoll_event mod_ev;
+                    mod_ev.events = EPOLLIN;
+                    mod_ev.data.fd = fd;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &mod_ev);
+                } else {
+                    close_connection(fd, connections, epoll_fd);
+                }
+            }
+        } else if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                close_connection(fd, connections, epoll_fd);
+            }
         }
-        response_string += "\r\n"; // End of headers
-        response_string += response.body; // Append the body
-
-        // Send the response back to the client
-        ssize_t sent_bytes = send(new_fd, response_string.c_str(), response_string.size(), 0);
-        if (sent_bytes < 0) {
-            std::cerr << "Send failed" << std::endl;
-        }
-
-        // Check if the response has a "Connection" header to determine if we should keep the connection alive
-        if (response.headers.find("connection") != response.headers.end()) {
-            connection = response.headers["connection"];
-        } 
-        
     }
-    close(new_fd); // Close the connection after sending the message
 }
 
 int main() {
+
     int sockfd;
 
     // AF_INET : IPv4 protocol
@@ -99,6 +204,8 @@ int main() {
         std::cerr << "Socket creation failed" << std::endl;
         return 1;
     }
+
+    set_nonblocking(sockfd);
 
     struct sockaddr_in address;
     address.sin_family = AF_INET;
@@ -113,27 +220,84 @@ int main() {
     }
 
     listen(sockfd, BACKLOG); // Listen for incoming connections
-    while(true) {
-        // sockaddr_storage because the kernel writes to it
-        struct sockaddr_storage their_addr;
-        socklen_t addr_size = sizeof(their_addr);
-        // Accept a new connection (creates a new socket for the connection)
-        int new_fd = accept(sockfd, (struct sockaddr*)&their_addr, &addr_size); // Accept a connection
-        if (new_fd < 0) {
-            std::cerr << "Accept failed" << std::endl;
-            continue; // Continue to accept new connections
-        }
-        try {
-            std::thread client_thread(handle_client, new_fd);
-            client_thread.detach();
-            ++thread_count;
-        } catch (const std::system_error& e) {
-            std::cerr << "Thread creation FAILED after " << thread_count.load()
-                    << " successful threads. Reason: " << e.what() << std::endl;
-            close(new_fd);
-        }
+
+    // Create an epoll instance to monitor multiple file descriptors
+    int epoll_fd = epoll_create1(0);
+    if(epoll_fd < 0) {
+        std::cerr << "Failed to create epoll file descriptor" << std::endl;
+        return 1;
+    }
+    
+    struct epoll_event ev;
+    // Set the events to monitor for the listening socket (EPOLLIN for incoming connections)
+    ev.events = EPOLLIN;    // Notify when the fd is ready for reading (incoming connections) 
+    ev.data.fd = sockfd;    // Which fd is this
+
+    // Add the listening socket to the set of file descriptors monitored by epoll and when it fires
+    // gives back a copy of ev 
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sockfd, &ev) < 0) {
+        std::cerr << "epoll_ctl ADD (listen socket) failed" << std::endl;
+        return 1;
     }
 
+    const int MAX_EVENTS = 64;
+    // Create an array to hold the events that epoll will return when file descriptors are ready
+    struct epoll_event events[MAX_EVENTS];
+    std::unordered_map<int, Connection> connections;
+
+    while (true) {
+        // Wait for events on the monitored file descriptors (blocking call)
+        // epoll_wait returns the number of file descriptors that are ready 
+        int num_ready = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if (num_ready < 0) {
+            std::cerr << "epoll_wait failed" << std::endl;
+            continue;
+        }
+
+        for (int i = 0; i < num_ready; i++) {
+            if (events[i].data.fd == sockfd) {
+                // Listening socket is ready, meaning at least one new connection is incoming
+                while (true) {
+                    // Storage for the address of the incoming connection
+                    struct sockaddr_storage their_addr;
+                    socklen_t addr_size = sizeof(their_addr);
+                    // Accept the incoming connection and get a new socket file descriptor for it
+                    int client_fd = accept(sockfd, (struct sockaddr*)&their_addr, &addr_size); 
+
+                    if (client_fd < 0) {
+                        break; // No more incoming connections to accept
+                    }
+
+                    // Set the new client socket to non-blocking mode (returns EAGAIN instead of blocking if no data is available)
+                    set_nonblocking(client_fd); 
+
+                    // Create an epoll_event structure for the new client socket
+                    struct epoll_event client_ev;
+                    client_ev.events = EPOLLIN;
+                    client_ev.data.fd = client_fd;
+
+                    // Add the new client socket to the epoll instance to monitor it for incoming data
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0) {
+                        std::cerr << "epoll_ctl ADD (client) failed" << std::endl;
+                        close(client_fd);
+                    }
+                    
+                    // Create a new Connection object for the new client and store it in the connections map
+                    Connection conn;
+                    conn.fd = client_fd;
+                    connections[client_fd] = conn;
+                }
+            } else {
+                int client_fd = events[i].data.fd;
+                // If the event indicates an error or hang-up on the client socket, we close the connection and clean up resources.
+                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+                    close_connection(client_fd, connections, epoll_fd);
+                    continue;
+                }
+                handle_client_ready(client_fd, connections, epoll_fd);
+            }
+        }
+    }
 
     return 0;
      
