@@ -15,9 +15,9 @@ concurrent connections, this architecture typically collapses.
 ## Environment
 
 - 4 CPU cores
-- ulimit -n: [fill in the value you're actually running with]
-- somaxconn: 4096
-- BACKLOG: 4096
+- ulimit -n: 65535
+- Backlog: 4096
+
 
 ## Baseline: thread-per-connection (naive)
 
